@@ -6,6 +6,7 @@ import re
 import uuid
 import warnings
 from functools import partial
+from time import perf_counter
 from typing import Any
 
 from dotenv import load_dotenv
@@ -31,6 +32,13 @@ CHROMA_PATH = os.path.join(BASE_DIR, "chroma")
 EMBEDDING_MODEL = "models/gemini-embedding-001"
 EVALUATOR_MODEL = "gemini-flash-latest"
 FOLLOWUP_MODEL = "gemini-2.0-flash-lite"  # lighter model for follow-up generation
+EVALUATION_TIMEOUT_SECONDS = float(os.getenv("EVALUATION_TIMEOUT_SECONDS", "20"))
+FOLLOWUP_TIMEOUT_SECONDS = float(os.getenv("FOLLOWUP_TIMEOUT_SECONDS", "4"))
+ENABLE_LLM_FOLLOWUPS = os.getenv("ENABLE_LLM_FOLLOWUPS", "true").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
 DATA_PATH = os.path.join(BASE_DIR, "data")
 
@@ -443,7 +451,23 @@ async def evaluate_answer_async(question: str, reference_answer: str, student_an
         f"Student Answer: {student_answer}\n"
     )
 
-    llm_output = await state.model.ainvoke(prompt)
+    try:
+        llm_output = await asyncio.wait_for(
+            state.model.ainvoke(prompt),
+            timeout=EVALUATION_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return EvaluationResult(
+            score=0,
+            factuality=0,
+            context=0,
+            originality=0,
+            example=0,
+            injection=False,
+            feedback="Evaluation timed out before the model returned a result.",
+            strengths=[],
+            improvements=["Retry the request or answer more concisely."],
+        )
 
     try:
         parsed = parse_json_from_llm(str(llm_output.content))
@@ -474,7 +498,7 @@ async def generate_followup_async(
     student_answer: str,
     evaluation: EvaluationResult,
 ) -> dict[str, str] | None:
-    if state.followup_model is None:
+    if state.followup_model is None or not ENABLE_LLM_FOLLOWUPS:
         return None
 
     weak = weak_dimensions(evaluation)
@@ -495,7 +519,10 @@ async def generate_followup_async(
     )
 
     try:
-        output = await state.followup_model.ainvoke(prompt)
+        output = await asyncio.wait_for(
+            state.followup_model.ainvoke(prompt),
+            timeout=FOLLOWUP_TIMEOUT_SECONDS,
+        )
         parsed = parse_json_from_llm(str(output.content))
     except Exception:
         return None
@@ -901,12 +928,25 @@ async def submit_answer(session_id: str, payload: AnswerRequest) -> AnswerRespon
     if question_row is None:
         raise HTTPException(status_code=404, detail="Question not found")
 
-    # --- Phase 1: evaluate answer (non-blocking ainvoke) ---
+    retrieval_query = (
+        f"{question_row['question']}\nCandidate answer: {payload.student_answer}"
+    )
+    similar_question_task = asyncio.create_task(
+        similar_subject_question_async(
+            session.subject,
+            retrieval_query,
+            session.used_question_ids,
+        )
+    )
+
+    # --- Phase 1: evaluate answer while local retrieval runs in parallel ---
+    started_at = perf_counter()
     evaluation = await evaluate_answer_async(
         question=question_row["question"],
         reference_answer=question_row["reference_answer"],
         student_answer=payload.student_answer,
     )
+    evaluation_latency = perf_counter() - started_at
 
     record = AnswerRecord(
         question_id=question_row["id"],
@@ -944,8 +984,40 @@ async def submit_answer(session_id: str, payload: AnswerRequest) -> AnswerRespon
                 progress=progress_info(session),
             )
 
-    # --- Phase 2: followup gen + similarity search run concurrently (outside lock) ---
-    next_row = await next_question_for_session_async(session, record)
+    # --- Phase 2: retrieval result is ready first; generated followups are optional ---
+    next_row = await similar_question_task
+
+    if ENABLE_LLM_FOLLOWUPS:
+        asked_questions: list[str] = [
+            row["question"]
+            for qid in session.used_question_ids
+            if (row := get_question_row(session, qid)) is not None
+        ]
+        followup_result = await generate_followup_async(
+            asked_questions=asked_questions,
+            previous_question=record.question,
+            previous_reference_answer=question_row["reference_answer"],
+            student_answer=record.student_answer,
+            evaluation=record.evaluation,
+        )
+        if followup_result:
+            new_id = session.next_generated_id
+            session.next_generated_id += 1
+            generated_row = {
+                "id": new_id,
+                "question": followup_result["question"],
+                "reference_answer": followup_result["reference_answer"],
+                "generated": True,
+                "focus": followup_result["focus"],
+            }
+            session.generated_questions[new_id] = generated_row
+            next_row = generated_row or next_row
+
+    if evaluation_latency > 5:
+        print(
+            f"Slow evaluation for session {session_id}: "
+            f"{evaluation_latency:.2f}s on question {payload.question_id}"
+        )
 
     async with state.lock:
         session = state.sessions.get(session_id)
