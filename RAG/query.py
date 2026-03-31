@@ -198,9 +198,11 @@ def main() -> None:
             db = None
 
     model = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-flash-latest",
         google_api_key=api_key,
     )
+
+    print(f"The model is: {model.model}\n")
     eval_prompt = ChatPromptTemplate.from_template(EVAL_TEMPLATE)
 
     local_chunks = load_subject_chunks_from_markdown(subject_path)
